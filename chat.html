@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat mesh</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+  body { max-width: 760px; margin: 2rem auto; padding: 0 16px; }
+  section { border: 1px solid #8886; border-radius: 8px; padding: 0 1rem 1rem; margin: 1rem 0; }
+  input { font: inherit; padding: .35rem; box-sizing: border-box; }
+  #message { width: 100%; }
+  button { font: inherit; padding: .35rem .9rem; }
+  li button { padding: .1rem .5rem; margin-left: .3rem; }
+  li { margin: .3rem 0; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  .message { margin: .4rem 0; overflow-wrap: anywhere; }
+  .message small, .muted { opacity: .7; }
+  .log { font: .8rem ui-monospace, monospace; white-space: pre-wrap; margin: 0; max-height: 20rem; overflow-y: auto; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.16.1/dist/mqtt.min.js"
+  integrity="sha384-ilRYg/zm2XqUafLvBoGVk40UfNRnvUkYMy+e/JPo4YgsFR6X9Q3jYEkqFQXquX4r" crossorigin="anonymous"></script>
+</head>
+<body>
+<h1>Chat mesh</h1>
+<p>Cada pessoa conecta direto (WebRTC) com só alguns vizinhos, e as mensagens se espalham por flooding, como no lab.
+  Tudo é cifrado de ponta a ponta: quem repassa carrega texto ilegível, e o mural público onde os navegadores se
+  encontram (um broker MQTT) também só vê texto cifrado.</p>
+
+<section>
+  <h2>Sala</h2>
+  <div class="row">
+    <span>sala <code id="room"></code></span>
+    <button id="invite">Copiar convite</button>
+    <label>seu nome <input id="name" maxlength="30"></label>
+  </div>
+  <p class="muted">O convite leva a chave da sala depois do <code>#</code>, que nunca sai do navegador. Mande só para quem
+    deve entrar: quem tem o link entra e recebe as chaves.</p>
+</section>
+
+<section>
+  <h2>Conversa</h2>
+  <div id="messages"></div>
+  <input id="message" placeholder="escreva e aperte Enter" maxlength="1000">
+</section>
+
+<section>
+  <h2>Participantes</h2>
+  <p>Sua impressão digital: <code id="my-fingerprint"></code></p>
+  <ul id="members"></ul>
+  <p class="muted">Compare a impressão digital de cada pessoa por outro canal (ligação, pessoalmente). Se bater, marque como
+    verificada: se um dia aparecer alguém com esse nome e outra chave, você é avisado. A lista pode incluir quem já saiu.</p>
+</section>
+
+<section>
+  <h2>Meus vizinhos diretos</h2>
+  <ul id="peers"></ul>
+  <p class="muted">Cada pessoa procura <span id="target"></span> vizinho(s). Para ver mensagens sendo repassadas, abra várias
+    abas com <code>?vizinhos=1</code> no endereço (antes do <code>#</code>).</p>
+</section>
+
+<section>
+  <h2>O que está acontecendo</h2>
+  <pre class="log" id="log"></pre>
+</section>
+
+<script type="module">
+import {
+  exportChain, exportPublicKey, fingerprintOf, importChain, importRoomKey, newChain, newIdentity, newRoomSecret,
+  newSessionKeys, pairwiseKey, ratchetSeal, ratchetUnseal, seal, sign, unseal, verify,
+} from './chat-crypto.js'
+
+const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt' // broker MQTT público e gratuito: só um mural para a sinalização
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+const GATHERING_LIMIT_MS = 3000
+const INITIAL_TTL = 8
+const MAX_TEXT = 1000
+const MAX_NAME = 30
+const INVITE_PATTERN = /^([\w-]{1,40})\.([\w-]{43})$/ // #sala.chave
+
+const requested = Number(new URLSearchParams(location.search).get('vizinhos'))
+const TARGET_LINKS = Number.isInteger(requested) && requested > 0 ? requested : 2
+
+const $ = id => document.getElementById(id)
+const log = text => {
+  $('log').textContent += `${new Date().toLocaleTimeString()}  ${text}\n`
+  $('log').scrollTop = $('log').scrollHeight
+}
+
+// ---------- convite e chaves ----------
+// Tudo depois do "#" fica no navegador: nunca vai para o GitHub nem para o broker.
+
+let [, room, secret] = location.hash.slice(1).match(INVITE_PATTERN) ?? []
+if (!room) {
+  room = crypto.randomUUID().slice(0, 8)
+  secret = newRoomSecret()
+  history.replaceState(null, '', `#${room}.${secret}`)
+}
+const roomKey = await importRoomKey(secret)
+const me = crypto.randomUUID().slice(0, 8) // id desta sessão na mesh
+const identity = await loadIdentity() // fica guardada neste navegador
+const session = await newSessionKeys() // só desta sessão: fechou a página, sumiu
+const signPub = await exportPublicKey(identity.publicKey)
+const dhPub = await exportPublicKey(session.publicKey)
+const myFingerprint = await fingerprintOf(signPub)
+let myChain = newChain()
+
+const links = new Map() // id do vizinho → { id, name, pc, channel, path }
+const members = new Map() // id da sessão → { peer, fingerprint, name, signPub, dhPub, pairwise, receiver }
+const pendingKeys = new Map() // chaves que chegaram antes do anúncio de quem mandou
+const removed = new Set() // impressões digitais tiradas desta conversa
+const unreachable = new Set() // vizinhos com quem a conexão direta falhou: não insisto
+const seen = new Set() // shortcut: cresce enquanto a página estiver aberta; uma sala longa expiraria ids antigos
+const trust = loadTrust() // impressão digital → { name, verified }, guardado neste navegador
+
+$('room').textContent = room
+$('target').textContent = TARGET_LINKS
+$('my-fingerprint').textContent = myFingerprint
+$('name').value = loadName() ?? `anon-${me.slice(0, 4)}`
+$('name').onchange = () => {
+  saveName($('name').value)
+  scheduleMemberAnnouncement()
+}
+const myName = () => $('name').value.trim().slice(0, MAX_NAME) || `anon-${me.slice(0, 4)}`
+
+// ---------- sinalização: o mural público, com tudo cifrado pela chave da sala ----------
+// Tópicos: ".../all" para todo mundo da sala e ".../to/<id>" para um peer específico.
+
+const topicFor = to => `mesh-lab-chat/${room}/${to ? `to/${to}` : 'all'}`
+const broker = mqtt.connect(BROKER_URL, { clean: true })
+
+broker.on('connect', () => {
+  log('conectado ao mural de sinalização')
+  broker.subscribe([topicFor(), topicFor(me)], { qos: 1 }, error => (error ? log(`mural: ${error.message}`) : announce()))
+})
+broker.on('error', error => log(`mural: ${error.message}`))
+broker.on('message', async (_topic, payload) => {
+  try {
+    const sealed = parseJson(payload.toString())
+    await onSignal(isSealed(sealed) ? parseSignal(await unseal(roomKey, sealed)) : undefined)
+  } catch (error) {
+    log(`erro na sinalização: ${error.message}`)
+  }
+})
+
+async function signal(to, message) {
+  const sealed = await seal(roomKey, { ...message, from: me, name: myName() })
+  broker.publish(topicFor(to), JSON.stringify(sealed), { qos: 1 })
+}
+
+function announce() {
+  log('aviso no mural: "estou aqui, quem está aí?"')
+  signal(null, { type: 'hello' })
+}
+
+async function onSignal(message) {
+  if (!message || message.from === me) return
+  const handlers = {
+    // Alguém chegou (ou perdeu vizinhos): digo que estou aqui. Quem chegou é que decide com quem conectar.
+    hello: () => {
+      if (links.has(message.from)) return
+      log(`${message.name} apareceu no mural; respondo que estou aqui`)
+      return signal(message.from, { type: 'here' })
+    },
+    here: () => {
+      if (links.size >= TARGET_LINKS || links.has(message.from) || unreachable.has(message.from)) return
+      return connectTo(message.from, message.name)
+    },
+    offer: () => acceptOffer(message),
+    answer: async () => {
+      const link = links.get(message.from)
+      if (link?.pc.signalingState !== 'have-local-offer') return
+      await link.pc.setRemoteDescription({ type: 'answer', sdp: message.sdp })
+    },
+  }
+  await handlers[message.type]()
+}
+
+// ---------- conexões diretas (WebRTC) ----------
+
+function createLink(id, name) {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  const link = { id, name, pc, channel: null, path: 'conectando...' }
+  links.set(id, link)
+  pc.ondatachannel = event => attachChannel(link, event.channel)
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState !== 'failed') return
+    unreachable.add(id)
+    log(`não deu para conectar direto com ${name}. As mensagens dessa pessoa ainda podem chegar repassadas por outros vizinhos`)
+    dropLink(link)
+  }
+  renderPeers()
+  return link
+}
+
+async function connectTo(id, name) {
+  const link = createLink(id, name)
+  log(`peço conexão direta a ${name}`)
+  attachChannel(link, link.pc.createDataChannel('mesh'))
+  await link.pc.setLocalDescription(await link.pc.createOffer())
+  await gathered(link.pc)
+  if (links.get(id) === link) await signal(id, { type: 'offer', sdp: link.pc.localDescription.sdp })
+}
+
+async function acceptOffer({ from, name, sdp }) {
+  const existing = links.get(from)
+  // Os dois pediram conexão ao mesmo tempo: vale o pedido de quem tem o menor id.
+  if (existing?.pc.signalingState === 'have-local-offer' && me < from) return
+  if (existing) dropLink(existing, { heal: false })
+  const link = createLink(from, name)
+  await link.pc.setRemoteDescription({ type: 'offer', sdp })
+  await link.pc.setLocalDescription(await link.pc.createAnswer())
+  await gathered(link.pc)
+  if (links.get(from) !== link) return
+  log(`${name} pediu conexão direta; respondi`)
+  await signal(from, { type: 'answer', sdp: link.pc.localDescription.sdp })
+}
+
+function attachChannel(link, channel) {
+  link.channel = channel
+  channel.onopen = async () => {
+    link.path = await chosenPath(link.pc)
+    log(`conectado direto com ${link.name}: ${link.path}`)
+    renderPeers()
+    scheduleMemberAnnouncement() // me apresento a quem estiver do outro lado
+  }
+  channel.onclose = () => dropLink(link)
+  channel.onmessage = event => onFlood(event.data, link).catch(error => log(`erro: ${error.message}`))
+}
+
+function dropLink(link, { heal = true } = {}) {
+  if (links.get(link.id) !== link) return
+  links.delete(link.id)
+  link.pc.close()
+  renderPeers()
+  if (!heal) return
+  log(`perdi a conexão com ${link.name}`)
+  // Autocura: com menos vizinhos que o alvo, volto ao mural para achar outros.
+  if (links.size < TARGET_LINKS) setTimeout(announce, 1000)
+}
+
+// Sem "trickle ICE": os candidatos vão dentro da oferta/resposta. O navegador demora para declarar a
+// coleta completa, mas host e srflx chegam em menos de 1s; por isso há um limite.
+function gathered(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  return new Promise(resolve => {
+    setTimeout(resolve, GATHERING_LIMIT_MS)
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') resolve()
+    })
+  })
+}
+
+async function chosenPath(pc) {
+  const stats = await pc.getStats()
+  let pair
+  stats.forEach(report => {
+    if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId)
+    if (report.type === 'candidate-pair' && report.selected) pair = report // Firefox
+  })
+  if (!pair) return 'conectado'
+  const types = [stats.get(pair.localCandidateId)?.candidateType, stats.get(pair.remoteCandidateId)?.candidateType]
+  if (types.includes('relay')) return 'via servidor TURN'
+  if (types.includes('srflx') || types.includes('prflx')) return 'direto, atravessando o NAT'
+  return 'direto pela rede local'
+}
+
+// ---------- mesh: flooding de envelopes cifrados ----------
+// Envelope: { id, ttl, path, iv, ct }. Só id, ttl e path ficam visíveis; o conteúdo vai cifrado com a chave da sala.
+
+async function flood(inner) {
+  const envelope = { id: crypto.randomUUID().slice(0, 8), ttl: INITIAL_TTL, path: [me], ...(await seal(roomKey, inner)) }
+  seen.add(envelope.id)
+  return relay(envelope)
+}
+
+async function onFlood(raw, link) {
+  const envelope = parseEnvelope(parseJson(raw))
+  if (!envelope) return log(`pacote inválido de ${link.name}, descartado`)
+  if (seen.has(envelope.id)) return log(`#${envelope.id} de ${link.name}: já vi, ignoro`)
+  seen.add(envelope.id)
+  // Repasso antes de abrir: para repassar não é preciso ler.
+  if (envelope.ttl > 1) relay({ ...envelope, ttl: envelope.ttl - 1, path: [...envelope.path, me] }, link.id)
+  const inner = parseInner(await unseal(roomKey, envelope))
+  if (!inner) return log(`#${envelope.id}: não abre com a chave da sala, descartado`)
+  await INNER_HANDLERS[inner.type](inner, envelope)
+}
+
+function relay(envelope, exceptId) {
+  const targets = [...links.values()].filter(link => link.id !== exceptId && link.channel?.readyState === 'open')
+  for (const link of targets) link.channel.send(JSON.stringify(envelope))
+  if (targets.length > 0) log(`#${envelope.id} → ${targets.map(link => link.name).join(', ')}  (cifrado: ${envelope.ct.slice(0, 16)}…)`)
+  return targets.length
+}
+
+// ---------- membros: identidade e entrega de chaves ----------
+
+let announceTimer
+function scheduleMemberAnnouncement() {
+  clearTimeout(announceTimer)
+  announceTimer = setTimeout(() => announceMember().catch(error => log(`erro: ${error.message}`)), 300)
+}
+
+async function announceMember() {
+  const name = myName()
+  const sig = await sign(identity.privateKey, ['member', me, name, dhPub])
+  await flood({ type: 'member', peer: me, name, signPub, dhPub, sig })
+}
+
+async function onMember(inner) {
+  if (inner.peer === me) return
+  if (!(await verify(inner.signPub, ['member', inner.peer, inner.name, inner.dhPub], inner.sig))) {
+    return log(`anúncio de ${inner.name} com assinatura inválida, ignorado`)
+  }
+  const known = members.get(inner.peer)
+  if (known && known.signPub !== inner.signPub) return log(`anúncio de ${inner.name} tentando tomar a sessão de ${known.name}, ignorado`)
+  if (known?.dhPub === inner.dhPub) {
+    if (known.name !== inner.name) log(`${known.name} agora se chama ${inner.name}`)
+    known.name = inner.name
+    return renderMembers()
+  }
+  const fingerprint = await fingerprintOf(inner.signPub)
+  const member = { ...inner, fingerprint, pairwise: await pairwiseKey(session.privateKey, inner.dhPub), receiver: undefined }
+  members.set(inner.peer, member)
+  log(`${member.name} entrou na conversa (impressão digital ${fingerprint})`)
+  if (hasConflict(member)) log(`⚠ ${member.name} está com uma chave diferente da que você verificou: pode ser outro aparelho, ou alguém se passando por essa pessoa`)
+  if (!Object.hasOwn(trust, fingerprint)) updateTrust(fingerprint, { name: member.name, verified: false })
+  renderMembers()
+
+  const pending = pendingKeys.get(inner.peer)
+  pendingKeys.delete(inner.peer)
+  if (pending) await onSenderKey(pending)
+  if (removed.has(fingerprint)) return
+  await sendSenderKey(member)
+  scheduleMemberAnnouncement() // para quem chegou também me conhecer
+}
+
+// Entrego minha corrente atual cifrada só para esta pessoa (chave combinada por ECDH).
+async function sendSenderKey(member) {
+  const sealed = await seal(member.pairwise, exportChain(myChain))
+  const sig = await sign(identity.privateKey, ['sender-key', me, member.peer, sealed.iv, sealed.ct])
+  await flood({ type: 'sender-key', from: me, to: member.peer, ...sealed, sig })
+}
+
+async function onSenderKey(inner) {
+  if (inner.to !== me) return // carta para outra pessoa: só repassei
+  const sender = members.get(inner.from)
+  if (!sender) {
+    if (pendingKeys.size < 50) pendingKeys.set(inner.from, inner)
+    return
+  }
+  if (!(await verify(sender.signPub, ['sender-key', inner.from, inner.to, inner.iv, inner.ct], inner.sig))) {
+    return log(`chave com assinatura inválida em nome de ${sender.name}, ignorada`)
+  }
+  const chain = importChain(await unseal(sender.pairwise, inner))
+  if (!chain) return log(`não consegui abrir a chave de ${sender.name}`)
+  sender.receiver = chain
+  log(`recebi a chave de ${sender.name}: a partir de agora leio o que essa pessoa escrever`)
+}
+
+// ---------- mensagens ----------
+
+async function sendChat(text) {
+  showMessage({ name: myName(), text, route: 'você' })
+  const sealed = await ratchetSeal(myChain, async n => ({ text, sig: await sign(identity.privateKey, ['chat', me, n, text]) }))
+  if ((await flood({ type: 'chat', from: me, ...sealed })) === 0) log('ninguém conectado ainda: a mensagem não saiu daqui')
+}
+
+async function onChatMessage(inner, envelope) {
+  const sender = members.get(inner.from)
+  const tag = `#${envelope.id}`
+  if (!sender) return log(`${tag}: mensagem de alguém que ainda não se apresentou`)
+  if (removed.has(sender.fingerprint)) return log(`${tag}: mensagem de ${sender.name}, que vocês tiraram da conversa; ignorada`)
+  if (!sender.receiver) return log(`${tag}: mensagem de ${sender.name} que não consigo ler (ainda não recebi a chave dessa pessoa)`)
+  const body = await ratchetUnseal(sender.receiver, inner)
+  if (!isText(MAX_TEXT)(body?.text) || !isText(200)(body?.sig)) {
+    return log(`${tag}: não consigo ler esta mensagem de ${sender.name}: ela é de antes da chave que recebi, ou essa pessoa trocou de chave sem me mandar a nova`)
+  }
+  if (!(await verify(sender.signPub, ['chat', inner.from, inner.n, body.text], body.sig))) {
+    return log(`${tag}: assinatura não confere: alguém tentou escrever em nome de ${sender.name}`)
+  }
+  showMessage({ name: sender.name, fingerprint: sender.fingerprint, text: body.text, route: routeOf(envelope.path) })
+}
+
+$('message').onkeydown = event => {
+  const text = event.target.value.trim().slice(0, MAX_TEXT)
+  if (event.key !== 'Enter' || !text) return
+  event.target.value = ''
+  sendChat(text).catch(error => log(`erro ao enviar: ${error.message}`))
+}
+
+// ---------- remoção ----------
+
+async function removeMember(member) {
+  if (!confirm(`Tirar ${member.name} da conversa? Você troca de chave, e essa pessoa não lê mais o que vier depois.`)) return
+  await applyRemoval(member.fingerprint)
+  const sig = await sign(identity.privateKey, ['remove', me, member.fingerprint])
+  await flood({ type: 'remove', from: me, target: member.fingerprint, sig })
+}
+
+async function onRemove(inner) {
+  const sender = members.get(inner.from)
+  if (!sender || removed.has(sender.fingerprint)) return
+  if (!(await verify(sender.signPub, ['remove', inner.from, inner.target], inner.sig))) return log('pedido de remoção com assinatura inválida, ignorado')
+  if (inner.target === myFingerprint) return log(`${sender.name} tirou você da conversa`)
+  if (removed.has(inner.target)) return
+  log(`${sender.name} tirou ${trust[inner.target]?.name ?? inner.target} da conversa`)
+  await applyRemoval(inner.target)
+}
+
+// Corrente nova, entregue só a quem ficou: quem saiu guarda a antiga, que não serve para mais nada.
+async function applyRemoval(fingerprint) {
+  removed.add(fingerprint)
+  myChain = newChain()
+  for (const member of members.values()) {
+    if (!removed.has(member.fingerprint)) await sendSenderKey(member)
+  }
+  renderMembers()
+  log('troquei minha chave e mandei a nova só para quem ficou')
+}
+
+// ---------- validação: tudo que chega do mural ou dos vizinhos é suspeito ----------
+
+function parseJson(raw) {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
+const isText = max => value => typeof value === 'string' && value.length <= max
+const isName = isText(MAX_NAME)
+const isPeerId = value => typeof value === 'string' && /^[0-9a-f]{8}$/.test(value)
+const isFingerprint = value => typeof value === 'string' && /^[0-9a-f]{4}( [0-9a-f]{4}){4}$/.test(value)
+const isSealed = value => isText(32)(value?.iv) && isText(30000)(value?.ct)
+
+function parseSignal(message) {
+  const needsSdp = ['offer', 'answer'].includes(message?.type)
+  const valid = message
+    && isPeerId(message.from)
+    && isName(message.name)
+    && ['hello', 'here', 'offer', 'answer'].includes(message.type)
+    && (!needsSdp || isText(20000)(message.sdp))
+  return valid ? message : undefined
+}
+
+function parseEnvelope(value) {
+  const valid = value
+    && isText(16)(value.id)
+    && Number.isInteger(value.ttl) && value.ttl >= 1 && value.ttl <= INITIAL_TTL
+    && Array.isArray(value.path) && value.path.length <= INITIAL_TTL + 1 && value.path.every(isPeerId)
+    && isSealed(value)
+  return valid ? value : undefined
+}
+
+const INNER_SHAPES = {
+  member: { peer: isPeerId, name: isName, signPub: isText(200), dhPub: isText(200), sig: isText(200) },
+  'sender-key': { from: isPeerId, to: isPeerId, iv: isText(32), ct: isText(400), sig: isText(200) },
+  chat: { from: isPeerId, n: Number.isInteger, iv: isText(32), ct: isText(8000) },
+  remove: { from: isPeerId, target: isFingerprint, sig: isText(200) },
+}
+const INNER_HANDLERS = { member: onMember, 'sender-key': onSenderKey, chat: onChatMessage, remove: onRemove }
+
+function parseInner(value) {
+  if (!Object.hasOwn(INNER_SHAPES, value?.type)) return undefined
+  return Object.entries(INNER_SHAPES[value.type]).every(([field, isValid]) => isValid(value[field])) ? value : undefined
+}
+
+// ---------- tela ----------
+
+function routeOf(path) {
+  if (path.length === 1) return 'direto'
+  return `repassada por ${path.slice(1).map(peer => members.get(peer)?.name ?? `?${peer.slice(0, 4)}`).join(' → ')}`
+}
+
+function showMessage({ name, fingerprint, text, route }) {
+  const item = document.createElement('div')
+  item.className = 'message'
+  const author = document.createElement('strong')
+  author.textContent = `${name}${trust[fingerprint]?.verified ? ' ✓' : ''}: `
+  const meta = document.createElement('small')
+  meta.textContent = `  (${route})`
+  item.append(author, text, meta) // texto puro: nada vindo de outro peer vira HTML
+  $('messages').append(item)
+  item.scrollIntoView({ block: 'nearest' })
+}
+
+const hasConflict = member =>
+  Object.entries(trust).some(([fingerprint, entry]) => fingerprint !== member.fingerprint && entry.verified && entry.name === member.name)
+
+function renderMembers() {
+  const button = (label, action) => Object.assign(document.createElement('button'), { textContent: label, onclick: action })
+  const items = [...members.values()].map(member => {
+    const { fingerprint } = member
+    const status = removed.has(fingerprint) ? 'fora da conversa'
+      : trust[fingerprint]?.verified ? '✓ verificada'
+      : hasConflict(member) ? '⚠ chave diferente da verificada' : 'não verificada'
+    const item = document.createElement('li')
+    item.append(`${member.name} · `, Object.assign(document.createElement('code'), { textContent: fingerprint }), ` · ${status}`)
+    if (!trust[fingerprint]?.verified) {
+      item.append(button('marcar como verificada', () => {
+        updateTrust(fingerprint, { name: member.name, verified: true })
+        renderMembers()
+      }))
+    }
+    if (!removed.has(fingerprint)) item.append(button('tirar da conversa', () => removeMember(member).catch(error => log(`erro: ${error.message}`))))
+    return item
+  })
+  $('members').replaceChildren(...(items.length > 0 ? items : [Object.assign(document.createElement('li'), { textContent: 'só você por enquanto' })]))
+}
+
+function renderPeers() {
+  const items = [...links.values()].map(link => Object.assign(document.createElement('li'), { textContent: `${link.name}: ${link.path}` }))
+  $('peers').replaceChildren(...(items.length > 0 ? items : [Object.assign(document.createElement('li'), { textContent: 'ninguém ainda. Mande o convite.' })]))
+}
+
+// ---------- armazenamento local (só deste navegador) ----------
+
+// A identidade fica no IndexedDB como chave não exportável: a página usa, mas nem ela consegue ler a chave privada.
+async function loadIdentity() {
+  try {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('mesh-lab-chat', 1)
+      request.onupgradeneeded = () => request.result.createObjectStore('keys')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    const run = (mode, action) => new Promise((resolve, reject) => {
+      const request = action(db.transaction('keys', mode).objectStore('keys'))
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    const stored = await run('readonly', store => store.get('identity'))
+    if (stored) return stored
+    const created = await newIdentity()
+    await run('readwrite', store => store.put(created, 'identity'))
+    return created
+  } catch (error) {
+    log(`não consegui guardar sua identidade (${error?.message ?? error}); ela vale só enquanto a página estiver aberta`)
+    return newIdentity()
+  }
+}
+
+function loadTrust() {
+  try {
+    const value = JSON.parse(localStorage.getItem('chat-trust'))
+    return value && typeof value === 'object' ? value : {}
+  } catch {
+    return {}
+  }
+}
+
+function updateTrust(fingerprint, changes) {
+  trust[fingerprint] = { ...trust[fingerprint], ...changes }
+  try {
+    localStorage.setItem('chat-trust', JSON.stringify(trust))
+  } catch {
+    // sem armazenamento local: a verificação vale só nesta sessão
+  }
+}
+
+function loadName() {
+  try {
+    return localStorage.getItem('chat-name')
+  } catch {
+    return null
+  }
+}
+
+function saveName(value) {
+  try {
+    localStorage.setItem('chat-name', value)
+  } catch {
+    // sem armazenamento local: o nome só não é lembrado da próxima vez
+  }
+}
+
+$('invite').onclick = () => navigator.clipboard.writeText(location.href).then(() => log('convite copiado (ele contém a chave da sala)'))
+addEventListener('hashchange', () => location.reload())
+addEventListener('pagehide', () => {
+  for (const link of links.values()) link.pc.close()
+  broker.end()
+})
+renderPeers()
+renderMembers()
+</script>
+</body>
+</html>

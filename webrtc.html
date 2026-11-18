@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC na mão</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+  body { max-width: 760px; margin: 2rem auto; padding: 0 16px; }
+  section { border: 1px solid #8886; border-radius: 8px; padding: 0 1rem 1rem; margin: 1rem 0; }
+  textarea, input { width: 100%; box-sizing: border-box; font: .8rem ui-monospace, monospace; }
+  textarea { height: 6rem; }
+  button { font: inherit; padding: .35rem .9rem; margin: .5rem .5rem 0 0; }
+  .log { font: .8rem ui-monospace, monospace; white-space: pre-wrap; margin: 0; }
+  .muted { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>WebRTC na mão</h1>
+<p>Dois navegadores conversando direto, sem servidor no meio do caminho dos dados. Só uma etapa precisa de intermediário: a
+  <b>sinalização</b>, que é trocar a "oferta" e a "resposta". Aqui o intermediário é você, copiando e colando (por chat, e-mail, o que for).</p>
+<p class="muted">Abra esta página em duas abas, dois navegadores ou dois aparelhos. O lado A clica em "Criar oferta"; o lado B cola a oferta e gera a resposta; o A cola a resposta. Pronto.</p>
+
+<section>
+  <h2>0. Mesma rede? Revele o IP local</h2>
+  <p class="muted">Por privacidade, o navegador esconde seu IP local atrás de um nome ".local". Para encontrar esse nome, o outro aparelho
+    depende de multicast, que o Android costuma filtrar no Wi-Fi. Com permissão de microfone, o navegador passa a mostrar o IP de verdade.
+    O microfone é desligado na mesma hora: nada é gravado nem enviado. Faça isso antes do passo 1, pelo menos no celular.</p>
+  <button id="reveal-ip">Revelar meu IP local</button>
+</section>
+
+<section>
+  <h2>1. Meu texto: copie e mande para o outro lado</h2>
+  <button id="create-offer">Criar oferta (sou o lado A)</button>
+  <button id="copy">Copiar</button>
+  <textarea id="local" readonly placeholder="a oferta ou a resposta aparece aqui depois que os candidatos forem coletados"></textarea>
+</section>
+
+<section>
+  <h2>2. Texto do outro lado: cole aqui</h2>
+  <textarea id="remote" placeholder="cole a oferta (se você é o B) ou a resposta (se você é o A)"></textarea>
+  <button id="use-remote">Usar o texto colado</button>
+</section>
+
+<section>
+  <h2>3. Candidatos ICE: por onde o mundo pode me alcançar</h2>
+  <pre class="log" id="candidates"></pre>
+</section>
+
+<section>
+  <h2>4. Chat direto</h2>
+  <input id="message" placeholder="disponível quando o canal abrir" disabled>
+  <pre class="log" id="chat"></pre>
+</section>
+
+<section>
+  <h2>Log</h2>
+  <button id="copy-log">Copiar log e candidatos</button>
+  <pre class="log" id="log"></pre>
+</section>
+
+<script>
+// STUN: um servidor público que só responde "de fora, seu IP:porta parecem ser X". É assim que se descobre o endereço do lado de fora do NAT.
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+
+const CANDIDATE_TYPES = {
+  host: 'endereço da própria máquina na rede local. Um nome ".local" é o navegador escondendo seu IP local (mDNS)',
+  srflx: 'server reflexive: seu endereço público, como o STUN viu. É o seu roteador/NAT por fora',
+  prflx: 'peer reflexive: descoberto durante os testes de conectividade com o outro lado',
+  relay: 'servidor TURN repassando o tráfego: o plano B quando não dá para conectar direto',
+}
+
+const $ = id => document.getElementById(id)
+const log = (element, text) => { $(element).textContent += `${new Date().toLocaleTimeString()}  ${text}\n` }
+
+let connection
+let channel
+
+function createConnection() {
+  connection = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  connection.onicecandidate = ({ candidate }) => {
+    if (!candidate) return log('log', 'coleta de candidatos terminada')
+    log('candidates', `${candidate.type.padEnd(5)} ${candidate.protocol} ${candidate.address}:${candidate.port}\n      → ${CANDIDATE_TYPES[candidate.type] ?? ''}`)
+  }
+  // O Chrome declara a falha em connectionState (o ICE fica em "disconnected"); navegadores sem connectionState usam o ICE.
+  pairsTimer = setInterval(snapshotPairs, 1000)
+  connection.onconnectionstatechange = () => {
+    const state = connection.connectionState
+    log('log', `conexão: ${state}`)
+    if (['connected', 'failed', 'closed'].includes(state)) clearInterval(pairsTimer)
+    if (state === 'failed') describeFailure()
+  }
+  connection.oniceconnectionstatechange = () => {
+    const state = connection.iceConnectionState
+    log('log', `ICE: ${state}`)
+    if (state === 'connected') describeChosenPath()
+    if (state === 'failed' && connection.connectionState === undefined) describeFailure()
+  }
+  connection.ondatachannel = event => setupChannel(event.channel)
+}
+
+function setupChannel(newChannel) {
+  channel = newChannel
+  channel.onopen = () => {
+    log('log', 'canal de dados aberto: daqui para frente nenhum servidor participa')
+    $('message').disabled = false
+    $('message').placeholder = 'escreva e aperte Enter'
+  }
+  channel.onmessage = event => log('chat', `outro lado: ${event.data}`)
+  channel.onclose = () => log('log', 'canal fechado')
+}
+
+// Sem "trickle ICE": espero os candidatos para que eles já vão dentro do texto copiado.
+// O navegador pode levar ~40s para declarar a coleta "completa" (timeouts em interfaces mortas),
+// mas host e srflx chegam em menos de 1s; por isso há um limite.
+const GATHERING_LIMIT_MS = 5000
+
+async function shareLocalDescription() {
+  log('log', `coletando candidatos (até ${GATHERING_LIMIT_MS / 1000}s)...`)
+  if (connection.iceGatheringState !== 'complete') {
+    await new Promise(resolve => {
+      setTimeout(resolve, GATHERING_LIMIT_MS)
+      connection.addEventListener('icegatheringstatechange', () => {
+        if (connection.iceGatheringState === 'complete') resolve()
+      })
+    })
+  }
+  $('local').value = JSON.stringify(connection.localDescription)
+  log('log', `${connection.localDescription.type === 'offer' ? 'oferta' : 'resposta'} pronta no quadro 1: copie e mande para o outro lado`)
+}
+
+async function describeChosenPath() {
+  const stats = await connection.getStats()
+  let pair
+  stats.forEach(report => {
+    if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId)
+    if (report.type === 'candidate-pair' && report.selected) pair = report // Firefox
+  })
+  if (!pair) return
+  const local = stats.get(pair.localCandidateId)
+  const remote = stats.get(pair.remoteCandidateId)
+  const types = [local.candidateType, remote.candidateType]
+  const meaning = types.includes('relay') ? 'passando por um servidor TURN'
+    : types.includes('srflx') || types.includes('prflx') ? 'direto, atravessando o NAT (hole punching)'
+    : 'direto pela rede local'
+  log('log', `caminho escolhido: eu ${where(local)}  ⇄  outro lado ${where(remote)}\n      → ${meaning}`)
+}
+
+// Cada par (meu candidato ⇄ candidato do outro lado) é um caminho que o ICE testa.
+// O Chrome apaga os pares quando desiste, então guardo um retrato de cada um enquanto os testes rodam.
+const testedPairs = new Map()
+let pairsTimer
+
+async function snapshotPairs() {
+  const stats = await connection.getStats()
+  stats.forEach(report => {
+    if (report.type !== 'candidate-pair') return
+    const local = stats.get(report.localCandidateId)
+    const remote = stats.get(report.remoteCandidateId)
+    if (!local || !remote) return
+    testedPairs.set(report.id, `  eu ${where(local)}  ⇄  outro lado ${where(remote)}\n      enviei ${report.requestsSent ?? 0} testes, recebi ${report.requestsReceived ?? 0} testes e ${report.responsesReceived ?? 0} respostas`)
+  })
+}
+
+// "enviei" sem nada recebido = os pacotes do outro lado não chegam aqui (firewall, roteador, NAT).
+function describeFailure() {
+  const pairs = [...testedPairs.values()]
+  log('log', `falhou: nenhum caminho funcionou. caminhos testados:\n${pairs.join('\n') || '  nenhum: os candidatos do outro lado eram nomes ".local" que não resolveram ou endereços inalcançáveis'}
+      → "recebi 0 testes": os pacotes do outro lado não chegam aqui. Um firewall neste aparelho (no Linux, ufw) descarta o que chega sem convite
+      → mesma rede: nomes ".local" do outro lado não viram caminho testado. Toque em "Revelar meu IP local" nos dois aparelhos
+      → redes diferentes: provavelmente NAT simétrico, que só um servidor TURN resolve`)
+}
+
+const where = candidate => `${candidate.candidateType} ${candidate.address || '(IP escondido)'}:${candidate.port}`
+
+$('create-offer').onclick = async () => {
+  createConnection()
+  setupChannel(connection.createDataChannel('chat'))
+  await connection.setLocalDescription(await connection.createOffer())
+  await shareLocalDescription()
+}
+
+$('use-remote').onclick = async () => {
+  let description
+  try {
+    description = JSON.parse($('remote').value)
+  } catch {
+    return log('log', 'o texto colado não é um JSON válido')
+  }
+  // a=candidate:<id> <componente> <protocolo> <prioridade> <endereço> <porta> typ <tipo>
+  const remoteCandidates = [...(description?.sdp ?? '').matchAll(/a=candidate:\S+ \d+ (\S+) \d+ (\S+) (\d+) typ (\w+)/g)]
+  const listed = remoteCandidates.map(([, protocol, address, port, type]) => `      ${type} ${protocol} ${address}:${port}`)
+  log('log', `o outro lado mandou ${remoteCandidates.length} candidato(s):\n${listed.join('\n') || '      nenhum'}`)
+  if (description?.type === 'offer') {
+    createConnection()
+    await connection.setRemoteDescription(description)
+    await connection.setLocalDescription(await connection.createAnswer())
+    return shareLocalDescription()
+  }
+  if (description?.type === 'answer' && connection) {
+    await connection.setRemoteDescription(description)
+    return log('log', 'resposta aplicada: testando pares de candidatos...')
+  }
+  log('log', 'esperava uma oferta (lado B) ou uma resposta depois de criar a oferta (lado A)')
+}
+
+$('copy').onclick = () => navigator.clipboard.writeText($('local').value).then(() => log('log', 'copiado'))
+
+$('copy-log').onclick = () => navigator.clipboard.writeText(`${$('candidates').textContent}\n${$('log').textContent}`).then(() => log('log', 'log copiado'))
+
+// Com permissão de captura, o navegador considera a página confiável e para de esconder o IP local (mDNS).
+$('reveal-ip').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    stream.getTracks().forEach(track => track.stop())
+  } catch (error) {
+    return log('log', `sem permissão de microfone (${error.name}): o IP local continua escondido`)
+  }
+  // Nem todo navegador revela o IP com a permissão; confiro em vez de supor.
+  const revealed = (await gatherHostAddresses()).filter(address => !address.endsWith('.local'))
+  if (revealed.length === 0) return log('log', 'permissão concedida, mas o navegador continua escondendo o IP local. Permita o microfone de forma permanente para este site (no cadeado da barra de endereço) e tente de novo.')
+  $('reveal-ip').disabled = true
+  $('reveal-ip').textContent = 'IP local revelado'
+  log('log', `IP local revelado: ${revealed.join(', ')} (o microfone já foi desligado)`)
+}
+
+// Uma conexão descartável só para ver quais endereços host o navegador expõe agora.
+async function gatherHostAddresses() {
+  const probe = new RTCPeerConnection()
+  const addresses = []
+  probe.onicecandidate = ({ candidate }) => {
+    if (candidate?.type === 'host' && candidate.address) addresses.push(candidate.address)
+  }
+  probe.createDataChannel('probe')
+  await probe.setLocalDescription(await probe.createOffer())
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  probe.close()
+  return [...new Set(addresses)]
+}
+
+$('message').onkeydown = event => {
+  if (event.key !== 'Enter' || !event.target.value) return
+  channel.send(event.target.value)
+  log('chat', `eu: ${event.target.value}`)
+  event.target.value = ''
+}
+
+window.onerror = message => log('log', `erro: ${message}`)
+window.onunhandledrejection = event => log('log', `erro: ${event.reason}`)
+</script>
+</body>
+</html>
